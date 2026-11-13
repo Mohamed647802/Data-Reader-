@@ -41,7 +41,11 @@ object Fmt {
 
 object UsageRepo {
 
-    data class Result(val items: List<AppUsage>, val separated: Boolean)
+    data class Result(
+        val items: List<AppUsage>,
+        val separated: Boolean,
+        val sinceMs: Long = 0L
+    )
 
     fun hasAccess(ctx: Context): Boolean {
         val ops = ctx.getSystemService(Context.APP_OPS_SERVICE) as AppOpsManager
@@ -58,34 +62,35 @@ object UsageRepo {
         return mode == AppOpsManager.MODE_ALLOWED
     }
 
-    /** sim: 0 = الكل، 1 = الشريحة الأولى، 2 = الشريحة الثانية */
+    /** sim: 0 = الكل، 1 = الخط الأول، 2 = الخط الثاني */
     fun query(ctx: Context, wifi: Boolean, sim: Int, start: Long, end: Long): Result {
         val nsm = ctx.getSystemService(Context.NETWORK_STATS_SERVICE) as NetworkStatsManager
         val acc = HashMap<Int, LongArray>()
-        var separated = true
+        var since = 0L
 
         if (wifi) {
             collect(nsm, ConnectivityManager.TYPE_WIFI, null, start, end, acc)
-        } else {
+        } else if (sim == 0) {
             val sims = activeSims(ctx)
-            if (sim == 0) {
-                if (Build.VERSION.SDK_INT >= 29 || sims.none { it.second != null }) {
-                    collect(nsm, ConnectivityManager.TYPE_MOBILE, null, start, end, acc)
-                } else {
-                    sims.forEach { s ->
-                        s.second?.let {
-                            collect(nsm, ConnectivityManager.TYPE_MOBILE, it, start, end, acc)
-                        }
+            if (Build.VERSION.SDK_INT >= 29 || sims.none { it.second != null }) {
+                collect(nsm, ConnectivityManager.TYPE_MOBILE, null, start, end, acc)
+            } else {
+                sims.forEach { s ->
+                    s.second?.let {
+                        collect(nsm, ConnectivityManager.TYPE_MOBILE, it, start, end, acc)
                     }
                 }
+            }
+        } else {
+            val id = activeSims(ctx).firstOrNull { Tracker.lineOf(it.first) == sim }?.second
+            if (Build.VERSION.SDK_INT < 29 && id != null) {
+                // أندرويد 9 وما قبله: النظام يسمح بالفصل مباشرة
+                collect(nsm, ConnectivityManager.TYPE_MOBILE, id, start, end, acc)
             } else {
-                val id = sims.firstOrNull { it.first == sim - 1 }?.second
-                if (id != null) {
-                    collect(nsm, ConnectivityManager.TYPE_MOBILE, id, start, end, acc)
-                } else {
-                    separated = false
-                    collect(nsm, ConnectivityManager.TYPE_MOBILE, null, start, end, acc)
-                }
+                // أندرويد 10+: من تسجيل التطبيق نفسه
+                Tracker.flush(ctx)
+                acc.putAll(Tracker.query(ctx, sim, start, end))
+                since = Tracker.since(ctx)
             }
         }
 
@@ -109,15 +114,16 @@ object UsageRepo {
             }
         }.filter { it.total > 0 }.sortedByDescending { it.total }
 
-        return Result(items, separated)
+        return Result(items, true, since)
     }
 
-    private fun collect(
+    /** يرجع true لو القراءة نجحت (حتى لو فاضية) */
+    fun collect(
         nsm: NetworkStatsManager, type: Int, subId: String?,
         start: Long, end: Long, acc: HashMap<Int, LongArray>
-    ) {
+    ): Boolean {
         var stats: NetworkStats? = null
-        try {
+        return try {
             stats = nsm.querySummary(type, subId, start, end)
             val bucket = NetworkStats.Bucket()
             while (stats.hasNextBucket()) {
@@ -126,8 +132,9 @@ object UsageRepo {
                 a[0] += bucket.rxBytes
                 a[1] += bucket.txBytes
             }
+            true
         } catch (e: Exception) {
-            // لا توجد بيانات لهذه الشبكة
+            false
         } finally {
             try { stats?.close() } catch (_: Exception) {}
         }
