@@ -2,15 +2,21 @@ package com.dataradar.app
 
 import android.Manifest
 import android.app.DatePickerDialog
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
 import android.provider.Settings
+import android.text.TextUtils
 import android.view.View
 import android.widget.Button
 import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
@@ -18,6 +24,7 @@ import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import java.text.SimpleDateFormat
 import java.util.Calendar
+import java.util.Date
 import java.util.Locale
 import java.util.concurrent.Executors
 
@@ -25,10 +32,11 @@ class MainActivity : AppCompatActivity() {
 
     private var wifiMode = true
     private var simSel = 0
-    private var askedPhone = false
+    private var askedPerms = false
     private val from = Calendar.getInstance()
     private val to = Calendar.getInstance()
     private val fmt = SimpleDateFormat("yyyy/MM/dd", Locale.ENGLISH)
+    private val dtFmt = SimpleDateFormat("yyyy/MM/dd HH:mm", Locale.ENGLISH)
     private val executor = Executors.newSingleThreadExecutor()
     private var reqId = 0
     private val adapter = AppAdapter()
@@ -77,12 +85,7 @@ class MainActivity : AppCompatActivity() {
         setRange(7)
 
         tabWifi.setOnClickListener { wifiMode = true; refreshUi(); load() }
-        tabData.setOnClickListener {
-            wifiMode = false
-            refreshUi()
-            ensurePhone()
-            load()
-        }
+        tabData.setOnClickListener { wifiMode = false; refreshUi(); load() }
         simAll.setOnClickListener { simSel = 0; refreshUi(); load() }
         sim1.setOnClickListener { simSel = 1; refreshUi(); load() }
         sim2.setOnClickListener { simSel = 2; refreshUi(); load() }
@@ -103,6 +106,9 @@ class MainActivity : AppCompatActivity() {
         super.onResume()
         if (UsageRepo.hasAccess(this)) {
             permBox.visibility = View.GONE
+            startTracker()
+            ensurePerms()
+            applyLineNames()
             load()
         } else {
             permBox.visibility = View.VISIBLE
@@ -111,13 +117,28 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun ensurePhone() {
-        if (!askedPhone && ContextCompat.checkSelfPermission(
-                this, Manifest.permission.READ_PHONE_STATE
+    private fun startTracker() {
+        try {
+            ContextCompat.startForegroundService(this, Intent(this, TrackerService::class.java))
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun ensurePerms() {
+        val need = ArrayList<String>()
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_PHONE_STATE)
+            != PackageManager.PERMISSION_GRANTED
+        ) need.add(Manifest.permission.READ_PHONE_STATE)
+        if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(
+                this, Manifest.permission.POST_NOTIFICATIONS
             ) != PackageManager.PERMISSION_GRANTED
-        ) {
-            askedPhone = true
-            ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.READ_PHONE_STATE), 1)
+        ) need.add(Manifest.permission.POST_NOTIFICATIONS)
+
+        if (need.isNotEmpty() && !askedPerms) {
+            askedPerms = true
+            ActivityCompat.requestPermissions(this, need.toTypedArray(), 1)
+        } else if (need.isEmpty()) {
+            askBattery()
         }
     }
 
@@ -125,8 +146,48 @@ class MainActivity : AppCompatActivity() {
         requestCode: Int, permissions: Array<out String>, grantResults: IntArray
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        startTracker()
+        applyLineNames()
+        askBattery()
         load()
     }
+
+    private fun askBattery() {
+        val p = getSharedPreferences("ui", Context.MODE_PRIVATE)
+        if (p.getBoolean("battery_asked", false)) return
+        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+        if (pm.isIgnoringBatteryOptimizations(packageName)) return
+        p.edit().putBoolean("battery_asked", true).apply()
+        AlertDialog.Builder(this)
+            .setTitle("تسجيل دقيق للخطين")
+            .setMessage("عشان التطبيق يفرّق بدقة بين استهلاك الخط الأول والثاني لازم يفضل شغّال في الخلفية. اسمح له بتجاهل توفير البطارية.")
+            .setPositiveButton("موافق") { _, _ ->
+                try {
+                    startActivity(
+                        Intent(
+                            Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                            Uri.parse("package:$packageName")
+                        )
+                    )
+                } catch (_: Exception) {
+                }
+            }
+            .setNegativeButton("لاحقاً", null)
+            .show()
+    }
+
+    private fun applyLineNames() {
+        val n = Tracker.lineNames(this)
+        sim1.text = shortName("الخط 1", n[1])
+        sim2.text = shortName("الخط 2", n[2])
+        for (v in listOf(sim1, sim2)) {
+            v.maxLines = 1
+            v.ellipsize = TextUtils.TruncateAt.END
+        }
+    }
+
+    private fun shortName(base: String, name: String?): String =
+        if (name.isNullOrBlank()) base else "$base · ${name.take(8)}"
 
     private fun setRange(days: Int) {
         to.timeInMillis = System.currentTimeMillis()
@@ -217,9 +278,10 @@ class MainActivity : AppCompatActivity() {
         val empty = r.items.isEmpty()
         tvEmpty.visibility = if (empty) View.VISIBLE else View.GONE
         rv.visibility = if (empty) View.GONE else View.VISIBLE
-        if (!wifiMode && simSel != 0 && !r.separated) {
+        if (!wifiMode && simSel != 0 && r.sinceMs > 0) {
             tvNote.visibility = View.VISIBLE
-            tvNote.text = "تعذّر فصل الشريحة على هذا الجهاز (أندرويد 10+ يمنع ذلك) — المعروض هو مجموع الشريحتين."
+            tvNote.text = "فصل الخطين مسجَّل بواسطة التطبيق منذ ${dtFmt.format(Date(r.sinceMs))}. " +
+                "ما قبل هذا الوقت لا يمكن فصله (قيد من أندرويد 10+). أبقِ الخدمة شغّالة."
         } else {
             tvNote.visibility = View.GONE
         }
